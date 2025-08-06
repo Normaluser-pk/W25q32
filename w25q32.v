@@ -27,6 +27,32 @@ module W25Q32 (
     localparam BUSY_BIT = 0;  // S0
     localparam WEL_BIT  = 1;  // S1
     
+    // SPI Slave interface wires
+    wire       spi_rx_dv;
+    wire [7:0] spi_rx_byte;
+    reg        spi_tx_dv;
+    reg  [7:0] spi_tx_byte;
+    wire       spi_miso;
+
+    // Tie physical wires
+    assign miso = spi_miso;
+
+    // Instantiate SPI_Slave
+    SPI_Slave #(
+        .SPI_MODE(0)
+    ) spi_slave_inst (
+        .i_Rst_L   (rst_n),
+        .i_Clk     (clk_i),
+        .o_RX_DV   (spi_rx_dv),
+        .o_RX_Byte (spi_rx_byte),
+        .i_TX_DV   (spi_tx_dv),
+        .i_TX_Byte (spi_tx_byte),
+        .i_SPI_Clk (spi_clk),
+        .o_SPI_MISO(spi_miso),
+        .i_SPI_MOSI(mosi),
+        .i_SPI_CS_n(cs_n)
+    );
+
     // State Machine States
     localparam STATE_IDLE         = 3'b000;
     localparam STATE_CMD          = 3'b001;
@@ -46,11 +72,6 @@ module W25Q32 (
     // Memory array 
     reg [7:0] memory [0:MEMORY_SIZE-1];
     
-    // SPI clock edge detection
-    reg spi_clk_prev;
-    wire spi_clk_posedge = spi_clk & ~spi_clk_prev;
-    wire spi_clk_negedge = ~spi_clk & spi_clk_prev;
-
     // Initialize memory
     initial begin
         integer i;
@@ -62,162 +83,75 @@ module W25Q32 (
     
     
 
-
-
-
-
-
-
-    // Main State Machine
+        // Main protocol state machine
     always @(posedge clk_i or negedge rst_n) begin
         if (!rst_n) begin
-            state <= STATE_IDLE;
-            status_reg <= 8'h00;
+            state       <= STATE_IDLE;
             command_reg <= 8'h00;
             address_reg <= 24'h000000;
-            data_buffer <= 8'h00;
-            bit_counter <= 5'h00;
-            byte_counter <= 5'h00;
-            miso <= 1'b0;
+            status_reg  <= 8'h00;
+            byte_counter<= 5'h00;
+            spi_tx_dv   <= 1'b0;
+            spi_tx_byte <= 8'h00;
         end else begin
-            state <= next_state;
-            
-            // Handle SPI communication on SPI clock edges
-            if (!cs_n && hold_n) begin  // Active when CS is low and HOLD is high
-                if (spi_clk_posedge) begin
-                    // Shift in data from MOSI on rising edge
-                    case (state)
-                        STATE_CMD: begin
-                            data_buffer <= {data_buffer[6:0], mosi};
-                            if (bit_counter == 7) begin
-                                command_reg <= {data_buffer[6:0], mosi};
-                            end
-                        end
-                        
-                        STATE_ADDR: begin
-                            data_buffer <= {data_buffer[6:0], mosi};
-                            if (bit_counter == 7) begin
-                                case (byte_counter)
-                                    0: address_reg[23:16] <= {data_buffer[6:0], mosi};
-                                    1: address_reg[15:8]  <= {data_buffer[6:0], mosi};
-                                    2: address_reg[7:0]   <= {data_buffer[6:0], mosi};
-                                endcase
-                            end
-                        end
-                    endcase
+            // Default: Don't transmit unless specifically set below
+            spi_tx_dv   <= 1'b0;
+            case (state)
+                STATE_IDLE: begin
+                    if (spi_rx_dv && !cs_n) begin
+                        command_reg <= spi_rx_byte;
+                        byte_counter<= 0;
+                        state <= STATE_CMD;
+                    end
                 end
-                
-                if (spi_clk_negedge) begin
-                    // Shift out data to MISO on falling edge
-                    case (state)
-                        STATE_READ_DATA: begin
-                            if (bit_counter == 0) begin
-                                // Load new byte from memory
-                                data_buffer <= memory[address_reg];
-                                miso <= memory[address_reg][7];
-                            end else begin
-                                // Shift out current byte
-                                miso <= data_buffer[7-bit_counter];
-                            end
+
+                STATE_CMD: begin
+                    if (cs_n) begin
+                        state <= STATE_IDLE;
+                    end else begin
+                        // Only READ DATA supported in this simple example
+                        if (command_reg == CMD_READ_DATA && spi_rx_dv) begin
+                            address_reg[23:16] <= spi_rx_byte;
+                            byte_counter <= 1;
+                            state <= STATE_ADDR;
                         end
-                        
-                        default: begin
-                            miso <= 1'b0;
-                        end
-                    endcase
+                    end
                 end
-            end
+
+                STATE_ADDR: begin
+                    if (cs_n) begin
+                        state <= STATE_IDLE;
+                    end else if (spi_rx_dv) begin
+                        if (byte_counter == 1) begin
+                            address_reg[15:8] <= spi_rx_byte;
+                            byte_counter <= 2;
+                        end else if (byte_counter == 2) begin
+                            address_reg[7:0] <= spi_rx_byte;
+                            state <= STATE_READ_DATA;
+                        end
+                    end
+                end
+
+                STATE_READ_DATA: begin
+                    if (cs_n) begin
+                        state <= STATE_IDLE;
+                    end else if (!cs_n) begin
+                        // Output memory data, page through as bytes arrive from master
+                        if (spi_rx_dv) begin
+                            spi_tx_byte <= memory[address_reg];
+                            spi_tx_dv <= 1'b1;
+                            address_reg <= address_reg + 1;
+                        end
+                    end
+                end
+
+                default: state <= STATE_IDLE;
+            endcase
         end
     end
+
+endmodule
     
-    // Next State Logic and Control
-    always @(*) begin
-        next_state = state;
-        
-        case (state)
-            STATE_IDLE: begin
-                if (!cs_n) begin
-                    next_state = STATE_CMD;
-                end
-            end
-            
-            STATE_CMD: begin
-                if (cs_n) begin
-                    next_state = STATE_IDLE;
-                end else if (spi_clk_posedge && bit_counter == 7) begin
-                    // Command received, determine next state
-                    case ({data_buffer[6:0], mosi})
-                        CMD_READ_DATA: next_state = STATE_ADDR;
-                        default: next_state = STATE_IDLE;  // Commands without address
-                    endcase
-                end
-            end
-            
-            STATE_ADDR: begin
-                if (cs_n) begin
-                    next_state = STATE_IDLE;
-                end else if (spi_clk_posedge && bit_counter == 7 && byte_counter == 2) begin
-                    // All 3 address bytes received
-                    case (command_reg)
-                        CMD_READ_DATA: next_state = STATE_READ_DATA;
-                        default: next_state = STATE_IDLE;
-                    endcase
-                end
-            end
-            
-            STATE_READ_DATA: begin
-                if (cs_n) begin
-                    next_state = STATE_IDLE;
-                end
-                // Stay in read state until CS goes high
-            end
-        endcase
-    end
-    
-    // Bit and Byte Counter Management
-    always @(posedge clk_i or negedge rst_n) begin
-        if (!rst_n) begin
-            bit_counter <= 5'h00;
-            byte_counter <= 5'h00;
-        end else if (cs_n) begin
-            bit_counter <= 5'h00;
-            byte_counter <= 5'h00;
-        end else if (spi_clk_posedge) begin
-            if (bit_counter == 7) begin
-                bit_counter <= 5'h00;
-                if (state == STATE_ADDR) begin
-                    byte_counter <= byte_counter + 1;
-                end
-            end else begin
-                bit_counter <= bit_counter + 1;
-            end
-        end
-    end
-    
-    // Address Auto-increment for Read Data
-    always @(posedge clk_i or negedge rst_n) begin
-        if (!rst_n) begin
-            // Address reset handled above
-        end else if (state == STATE_READ_DATA && spi_clk_negedge && bit_counter == 7) begin
-            address_reg <= address_reg + 1;
-        end
-    end
-    
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
      // Command Execution
     always @(posedge clk_i or negedge rst_n) begin
