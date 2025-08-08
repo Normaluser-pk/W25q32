@@ -4,15 +4,15 @@ module W25Q32 (
     input  wire        spi_clk,   
     input  wire        cs_n,      
     input  wire        mosi,       
-    output reg         miso,    
+    output wire        miso,
     input  wire        wp_n,      
     input  wire        hold_n  
 );
 
     // W25Q32 Parameters
-    localparam MEMORY_SIZE = 1*1024*1024;  // 1MB
+    localparam MEMORY_SIZE = 1*1024*1024;  // 1MB  
     localparam PAGE_SIZE   = 64;           // 64 bytes per page
-    localparam SECTOR_SIZE = 1024;          // 1024 bytes per block
+    localparam SECTOR_SIZE = 1024;         // 1024 bytes per block
     localparam ADDR_WIDTH  = 24;           // 24-bit addressing
     
     // Instruction Opcodes
@@ -22,7 +22,8 @@ module W25Q32 (
     localparam CMD_WRITE_DISABLE = 8'h04;  // Write Disable
     localparam CMD_SECTOR_ERASE  = 8'h20;  // Sector Erase
     localparam CMD_CHIP_ERASE    = 8'hC7;  // Chip Erase
-    localparam CMD_CHIP_ERASE2   = 8'h60;  // Chip Erase (does the same)
+    localparam CMD_CHIP_ERASE2   = 8'h60;  // Chip Erase (same as the above)
+    localparam CMD_READ_STATUS   = 8'h05;  // Read Status Register
     
     // Status Register Bits
     localparam BUSY_BIT = 0;  // S0
@@ -34,6 +35,10 @@ module W25Q32 (
     reg        spi_tx_dv;
     reg  [7:0] spi_tx_byte;
     wire       spi_miso;
+
+    // Additional internal signals
+    reg        write_enable;      // Write enable flag
+    reg        spi_clk_prev;      // Previous SPI clock state for edge detection
 
     // Tie physical wires
     assign miso = spi_miso;
@@ -60,8 +65,7 @@ module W25Q32 (
     localparam STATE_ADDR         = 3'b010;
     localparam STATE_READ_DATA    = 3'b011;
     localparam STATE_PAGE_PROGRAM = 3'b100;
-    localparam STATE_DUMMY        = 3'b101;
-    
+    localparam STATE_READ_STATUS  = 3'b101;
     
     // Internal Registers
     reg [2:0]  state, next_state;
@@ -70,8 +74,18 @@ module W25Q32 (
     reg [23:0] address_reg;     
     reg [7:0]  data_buffer;       
     reg [4:0]  bit_counter;      
-    reg [4:0]  byte_counter;       
+    reg [4:0]  byte_counter;
+
+    // Erase operation states
+    localparam ERASE_IDLE    = 2'b00;
+    localparam ERASE_CHIP    = 2'b01;
+    localparam ERASE_SECTOR  = 2'b10;
     
+    // Erase operation registers 
+    reg [1:0]  erase_state;
+    reg [23:0] erase_addr;
+    reg [15:0] erase_counter;    // Counter for erase timing
+       
     // Memory array 
     reg [7:0] memory [0:MEMORY_SIZE-1];
     
@@ -81,24 +95,111 @@ module W25Q32 (
         for (i = 0; i < MEMORY_SIZE; i = i + 1) begin
             memory[i] = 8'hFF;  //Default erased state
         end
+        status_reg = 8'h00;
+        write_enable = 1'b0;
+        erase_state = ERASE_IDLE;
     end
 
-    
-    
+    // SPI clock edge detection
+    always @(posedge clk_i or negedge rst_n) begin
+        if (!rst_n) begin
+            spi_clk_prev <= 1'b0;
+        end else begin
+            spi_clk_prev <= spi_clk;
+        end
+    end
 
-        // Main protocol state machine
+    // Write enable logic 
+    always @(posedge clk_i or negedge rst_n) begin
+        if (!rst_n) begin
+            write_enable <= 1'b0;
+        end else begin
+            if (command_reg == CMD_WRITE_ENABLE && cs_n && state == STATE_CMD) begin
+                write_enable <= 1'b1;
+                status_reg[WEL_BIT] <= 1'b1;
+            end else if (command_reg == CMD_WRITE_DISABLE && cs_n && state == STATE_CMD) begin
+                write_enable <= 1'b0;
+                status_reg[WEL_BIT] <= 1'b0;
+            end else if ((command_reg == CMD_PAGE_PROGRAM || 
+                         command_reg == CMD_SECTOR_ERASE || 
+                         command_reg == CMD_CHIP_ERASE || 
+                         command_reg == CMD_CHIP_ERASE2) && cs_n && state != STATE_IDLE) begin
+                write_enable <= 1'b0; // Auto-clear after write operations
+                status_reg[WEL_BIT] <= 1'b0;
+            end
+        end
+    end
+
+    always @(posedge clk_i or negedge rst_n) begin
+        if (!rst_n) begin
+            erase_state <= ERASE_IDLE;
+            erase_addr <= 24'h000000;
+            erase_counter <= 16'h0000;
+        end else begin
+            case (erase_state)
+                ERASE_IDLE: begin
+                    if ((command_reg == CMD_CHIP_ERASE || command_reg == CMD_CHIP_ERASE2) 
+                        && write_enable && cs_n && state == STATE_CMD) begin
+                        erase_state <= ERASE_CHIP;
+                        erase_addr <= 24'h000000;
+                        status_reg[BUSY_BIT] <= 1'b1;
+                        erase_counter <= 16'h1000; 
+                        $display("%t W25Q32: CHIP ERASE started", $time);
+                    end else if (command_reg == CMD_SECTOR_ERASE && write_enable && cs_n && state == STATE_CMD) begin
+                        erase_state <= ERASE_SECTOR;
+                        erase_addr <= (address_reg / SECTOR_SIZE) * SECTOR_SIZE;
+                        status_reg[BUSY_BIT] <= 1'b1;
+                        erase_counter <= 16'h0100; 
+                        $display("%t W25Q32: SECTOR ERASE started at 0x%06h", $time, (address_reg / SECTOR_SIZE) * SECTOR_SIZE);
+                    end
+                end
+                
+                ERASE_CHIP: begin
+                    if (erase_counter > 0) begin
+                        erase_counter <= erase_counter - 1;
+                    end else if (erase_addr < MEMORY_SIZE) begin
+                        // Erase in chunks to avoid blocking
+                        for (integer j = 0; j < 256 && (erase_addr + j) < MEMORY_SIZE; j = j + 1) begin
+                            memory[erase_addr + j] <= 8'hFF;
+                        end
+                        erase_addr <= erase_addr + 256;
+                        erase_counter <= 16'h0010; 
+                    end else begin
+                        erase_state <= ERASE_IDLE;
+                        status_reg[BUSY_BIT] <= 1'b0;
+                        $display("%t W25Q32: CHIP ERASE completed", $time);
+                    end
+                end
+                
+                ERASE_SECTOR: begin
+                    if (erase_counter > 0) begin
+                        erase_counter <= erase_counter - 1;
+                    end else begin
+                        for (integer k = 0; k < SECTOR_SIZE; k = k + 1) begin
+                            memory[erase_addr + k] <= 8'hFF;
+                        end
+                        erase_state <= ERASE_IDLE;
+                        status_reg[BUSY_BIT] <= 1'b0;
+                        $display("%t W25Q32: SECTOR ERASE completed at 0x%06h", $time, erase_addr);
+                    end
+                end
+            endcase
+        end
+    end
+
     always @(posedge clk_i or negedge rst_n) begin
         if (!rst_n) begin
             state       <= STATE_IDLE;
             command_reg <= 8'h00;
             address_reg <= 24'h000000;
-            status_reg  <= 8'h00;
+            status_reg[BUSY_BIT] <= 1'b0;
             byte_counter<= 5'h00;
             spi_tx_dv   <= 1'b0;
             spi_tx_byte <= 8'h00;
         end else begin
             // Default: Don't transmit unless specifically set below
             spi_tx_dv   <= 1'b0;
+            
             case (state)
                 STATE_IDLE: begin
                     if (spi_rx_dv && !cs_n) begin
@@ -112,11 +213,19 @@ module W25Q32 (
                     if (cs_n) begin
                         state <= STATE_IDLE;
                     end else begin
-                        // Only READ DATA supported in this simple example
-                        if (command_reg == CMD_READ_DATA && spi_rx_dv) begin
+                        // Handle commands that need address
+                        if ((command_reg == CMD_READ_DATA || command_reg == CMD_PAGE_PROGRAM || 
+                             command_reg == CMD_SECTOR_ERASE) && spi_rx_dv) begin
                             address_reg[23:16] <= spi_rx_byte;
                             byte_counter <= 1;
                             state <= STATE_ADDR;
+                            if (command_reg == CMD_PAGE_PROGRAM) begin
+                                status_reg[BUSY_BIT] <= 1'b1;
+                            end
+                        end
+                        // Handle commands without address
+                        else if (command_reg == CMD_READ_STATUS && spi_rx_dv) begin
+                            state <= STATE_READ_STATUS;
                         end
                     end
                 end
@@ -130,7 +239,12 @@ module W25Q32 (
                             byte_counter <= 2;
                         end else if (byte_counter == 2) begin
                             address_reg[7:0] <= spi_rx_byte;
-                            state <= STATE_READ_DATA;
+                            // Transition to appropriate data state
+                            if (command_reg == CMD_READ_DATA) begin
+                                state <= STATE_READ_DATA;
+                            end else if (command_reg == CMD_PAGE_PROGRAM && write_enable) begin
+                                state <= STATE_PAGE_PROGRAM;
+                            end
                         end
                     end
                 end
@@ -138,22 +252,43 @@ module W25Q32 (
                 STATE_READ_DATA: begin
                     if (cs_n) begin
                         state <= STATE_IDLE;
-                    end else if (!cs_n) begin
-                        // Output memory data, page through as bytes arrive from master
-                        if (spi_rx_dv) begin
+                    end else begin
+                        // Always output current memory data
+                        if (address_reg < MEMORY_SIZE) begin
                             spi_tx_byte <= memory[address_reg];
-                            spi_tx_dv <= 1'b1;
-                            address_reg <= address_reg + 1;
+                        end else begin
+                            spi_tx_byte <= 8'hFF; // Out of bounds
+                        end
+                        spi_tx_dv <= 1'b1;
+                        
+                        // Increment address for next byte when current byte is read
+                        if (spi_rx_dv) begin
+                            address_reg <= (address_reg + 1) % MEMORY_SIZE; // Wrap around
                         end
                     end
                 end
 
                 STATE_PAGE_PROGRAM: begin
-                    if (cs_n) 
+                    if (cs_n) begin
                         state <= STATE_IDLE;
-                    else if (spi_rx_dv && write_enable) begin
+                        status_reg[BUSY_BIT] <= 1'b0;
+                    end else if (spi_rx_dv && write_enable && address_reg < MEMORY_SIZE) begin
                         memory[address_reg] <= spi_rx_byte;
-                        address_reg <= address_reg + 1;
+                        
+                        if ((address_reg & (PAGE_SIZE-1)) == (PAGE_SIZE-1)) begin
+                            address_reg <= address_reg & ~(PAGE_SIZE-1);
+                        end else begin
+                            address_reg <= address_reg + 1;
+                        end
+                    end
+                end
+
+                STATE_READ_STATUS: begin
+                    if (cs_n) begin
+                        state <= STATE_IDLE;
+                    end else begin
+                        spi_tx_byte <= status_reg;
+                        spi_tx_dv <= 1'b1;
                     end
                 end
 
@@ -162,63 +297,4 @@ module W25Q32 (
         end
     end
 
-
-    
-
-     // Command Execution
-    always @(posedge clk_i or negedge rst_n) begin
-        if (!rst_n) begin
-            status_reg[WEL_BIT] <= 1'b0;
-            status_reg[BUSY_BIT] <= 1'b0;
-        end else if (cs_n && state == STATE_CMD && spi_clk_prev) begin
-            // Execute command when CS goes high after command phase
-            case (command_reg)
-                CMD_WRITE_ENABLE: begin
-                    status_reg[WEL_BIT] <= 1'b1;
-                    status_reg[BUSY_BIT] <= 1'b1;
-                    $display("W25Q32JV: Write Enable executed - WEL set to 1");
-                end
-                
-                CMD_WRITE_DISABLE: begin
-                    status_reg[WEL_BIT] <= 1'b0;
-                    status_reg[BUSY_BIT] <= 1'b0;
-                    $display("W25Q32JV: Write Disable executed - WEL cleared to 0");
-                end
-                
-                CMD_READ_DATA: begin
-                    $display("W25Q32JV: Read Data command initiated");
-                end
-
-                CMD_CHIP_ERASE,
-                CMD_CHIP_ERASE2: begin
-                    if (status_reg[WEL_BIT]) begin
-                        status_reg[BUSY_BIT] <= 1'b1;
-                        for (integer m=0; m<MEMORY_SIZE; m=m+1)
-                            memory[m] = 8'hFF;
-                        status_reg[WEL_BIT]  <= 1'b0;
-                        status_reg[BUSY_BIT] <= 1'b0;
-                        $display("%t W25Q32JV : CHIP ERASE completed",$time);
-                    end
-                end
-
-                CMD_SECTOR_ERASE: begin
-                    if (status_reg[WEL_BIT]) begin
-                        status_reg[BUSY_BIT] <= 1'b1;
-                        integer saddr, idx;
-                        saddr = (address_reg / SECTOR_SIZE) * SECTOR_SIZE;
-                        for (idx = 0; idx < SECTOR_SIZE; idx = idx + 1)
-                            memory[saddr + idx] = 8'hFF;
-                        status_reg[WEL_BIT]  <= 1'b0;
-                        status_reg[BUSY_BIT] <= 1'b0;
-                        $display("%t W25Q32 : SE at 0x%06h (1 KiB) done",$time,saddr);
-                    end
-                end
-
-                default: begin
-                    $display("W25Q32: Unknown command: %02h", command_reg);
-                end
-            endcase
-        end
-    end
-    
 endmodule
