@@ -17,6 +17,7 @@ module W25Q32 (
     
     // Instruction Opcodes
     localparam CMD_WRITE_ENABLE  = 8'h06;  // Write Enable
+    localparam CMD_PAGE_PROGRAM  = 8'h02;  // Page Program
     localparam CMD_READ_DATA     = 8'h03;  // Read Data
     localparam CMD_WRITE_DISABLE = 8'h04;  // Write Disable
     localparam CMD_SECTOR_ERASE  = 8'h20;  // Sector Erase
@@ -58,7 +59,9 @@ module W25Q32 (
     localparam STATE_CMD          = 3'b001;
     localparam STATE_ADDR         = 3'b010;
     localparam STATE_READ_DATA    = 3'b011;
-    localparam STATE_DUMMY        = 3'b100;
+    localparam STATE_PAGE_PROGRAM = 3'b100;
+    localparam STATE_DUMMY        = 3'b101;
+    
     
     // Internal Registers
     reg [2:0]  state, next_state;
@@ -145,12 +148,21 @@ module W25Q32 (
                     end
                 end
 
+                STATE_PAGE_PROGRAM: begin
+                    if (cs_n) 
+                        state <= STATE_IDLE;
+                    else if (spi_rx_dv && write_enable) begin
+                        memory[address_reg] <= spi_rx_byte;
+                        address_reg <= address_reg + 1;
+                    end
+                end
+
                 default: state <= STATE_IDLE;
             endcase
         end
     end
 
-endmodule
+
     
 
      // Command Execution
@@ -209,3 +221,4 @@ endmodule
         end
     end
     
+endmodule
