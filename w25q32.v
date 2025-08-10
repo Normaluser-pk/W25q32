@@ -27,7 +27,7 @@ module W25Q32 (
     
     // Status Register Bits
     localparam BUSY_BIT = 0;  // S0
-    localparam WEL_BIT  = 1;  // S1
+    localparam WEL_BIT  = 0;  // S1
     
     // SPI Slave interface wires
     wire       spi_rx_dv;
@@ -88,104 +88,17 @@ module W25Q32 (
        
     // Memory array 
     reg [7:0] memory [0:MEMORY_SIZE-1];
-    
+
+    integer i;
     // Initialize memory
     initial begin
-        integer i;
         for (i = 0; i < MEMORY_SIZE; i = i + 1) begin
             memory[i] = 8'hFF;  //Default erased state
         end
         status_reg = 8'h00;
         write_enable = 1'b0;
         erase_state = ERASE_IDLE;
-    end
-
-    // SPI clock edge detection
-    always @(posedge clk_i or negedge rst_n) begin
-        if (!rst_n) begin
-            spi_clk_prev <= 1'b0;
-        end else begin
-            spi_clk_prev <= spi_clk;
-        end
-    end
-
-    // Write enable logic 
-    always @(posedge clk_i or negedge rst_n) begin
-        if (!rst_n) begin
-            write_enable <= 1'b0;
-        end else begin
-            if (command_reg == CMD_WRITE_ENABLE && cs_n && state == STATE_CMD) begin
-                write_enable <= 1'b1;
-                status_reg[WEL_BIT] <= 1'b1;
-            end else if (command_reg == CMD_WRITE_DISABLE && cs_n && state == STATE_CMD) begin
-                write_enable <= 1'b0;
-                status_reg[WEL_BIT] <= 1'b0;
-            end else if ((command_reg == CMD_PAGE_PROGRAM || 
-                         command_reg == CMD_SECTOR_ERASE || 
-                         command_reg == CMD_CHIP_ERASE || 
-                         command_reg == CMD_CHIP_ERASE2) && cs_n && state != STATE_IDLE) begin
-                write_enable <= 1'b0; // Auto-clear after write operations
-                status_reg[WEL_BIT] <= 1'b0;
-            end
-        end
-    end
-
-    always @(posedge clk_i or negedge rst_n) begin
-        if (!rst_n) begin
-            erase_state <= ERASE_IDLE;
-            erase_addr <= 24'h000000;
-            erase_counter <= 16'h0000;
-        end else begin
-            case (erase_state)
-                ERASE_IDLE: begin
-                    if ((command_reg == CMD_CHIP_ERASE || command_reg == CMD_CHIP_ERASE2) 
-                        && write_enable && cs_n && state == STATE_CMD) begin
-                        erase_state <= ERASE_CHIP;
-                        erase_addr <= 24'h000000;
-                        status_reg[BUSY_BIT] <= 1'b1;
-                        erase_counter <= 16'h1000; 
-                        $display("%t W25Q32: CHIP ERASE started", $time);
-                    end else if (command_reg == CMD_SECTOR_ERASE && write_enable && cs_n && state == STATE_CMD) begin
-                        erase_state <= ERASE_SECTOR;
-                        erase_addr <= (address_reg / SECTOR_SIZE) * SECTOR_SIZE;
-                        status_reg[BUSY_BIT] <= 1'b1;
-                        erase_counter <= 16'h0100; 
-                        $display("%t W25Q32: SECTOR ERASE started at 0x%06h", $time, (address_reg / SECTOR_SIZE) * SECTOR_SIZE);
-                    end
-                end
-                
-                ERASE_CHIP: begin
-                    if (erase_counter > 0) begin
-                        erase_counter <= erase_counter - 1;
-                    end else if (erase_addr < MEMORY_SIZE) begin
-                        // Erase in chunks to avoid blocking
-                        for (integer j = 0; j < 256 && (erase_addr + j) < MEMORY_SIZE; j = j + 1) begin
-                            memory[erase_addr + j] <= 8'hFF;
-                        end
-                        erase_addr <= erase_addr + 256;
-                        erase_counter <= 16'h0010; 
-                    end else begin
-                        erase_state <= ERASE_IDLE;
-                        status_reg[BUSY_BIT] <= 1'b0;
-                        $display("%t W25Q32: CHIP ERASE completed", $time);
-                    end
-                end
-                
-                ERASE_SECTOR: begin
-                    if (erase_counter > 0) begin
-                        erase_counter <= erase_counter - 1;
-                    end else begin
-                        for (integer k = 0; k < SECTOR_SIZE; k = k + 1) begin
-                            memory[erase_addr + k] <= 8'hFF;
-                        end
-                        erase_state <= ERASE_IDLE;
-                        status_reg[BUSY_BIT] <= 1'b0;
-                        $display("%t W25Q32: SECTOR ERASE completed at 0x%06h", $time, erase_addr);
-                    end
-                end
-            endcase
-        end
-    end
+    end    
 
     always @(posedge clk_i or negedge rst_n) begin
         if (!rst_n) begin
@@ -296,5 +209,84 @@ module W25Q32 (
             endcase
         end
     end
+
+    always @(posedge clk_i or negedge rst_n) begin
+        if (!rst_n) begin
+            erase_state <= ERASE_IDLE;
+            erase_addr <= 24'h000000;
+            erase_counter <= 16'h0000;
+        end else begin
+            case (erase_state)
+                ERASE_IDLE: begin
+                    if ((command_reg == CMD_CHIP_ERASE || command_reg == CMD_CHIP_ERASE2) 
+                        && write_enable && cs_n && state == STATE_CMD) begin
+                        erase_state <= ERASE_CHIP;
+                        erase_addr <= 24'h000000;
+                        status_reg[BUSY_BIT] <= 1'b1;
+                        erase_counter <= 16'h1000; 
+                        $display("%t W25Q32: CHIP ERASE started", $time);
+                    end else if (command_reg == CMD_SECTOR_ERASE && write_enable && cs_n && state == STATE_CMD) begin
+                        erase_state <= ERASE_SECTOR;
+                        erase_addr <= (address_reg / SECTOR_SIZE) * SECTOR_SIZE;
+                        status_reg[BUSY_BIT] <= 1'b1;
+                        erase_counter <= 16'h0100; 
+                        $display("%t W25Q32: SECTOR ERASE started at 0x%06h", $time, (address_reg / SECTOR_SIZE) * SECTOR_SIZE);
+                    end
+                end
+                
+                ERASE_CHIP: begin
+                    if (erase_counter > 0) begin
+                        erase_counter <= erase_counter - 1;
+                    end else if (erase_addr < MEMORY_SIZE) begin
+                        // Erase in chunks to avoid blocking
+                        for (integer j = 0; j < 256 && (erase_addr + j) < MEMORY_SIZE; j = j + 1) begin
+                            memory[erase_addr + j] <= 8'hFF;
+                        end
+                        erase_addr <= erase_addr + 256;
+                        erase_counter <= 16'h0010; 
+                    end else begin
+                        erase_state <= ERASE_IDLE;
+                        status_reg[BUSY_BIT] <= 1'b0;
+                        $display("%t W25Q32: CHIP ERASE completed", $time);
+                    end
+                end
+                
+                ERASE_SECTOR: begin
+                    if (erase_counter > 0) begin
+                        erase_counter <= erase_counter - 1;
+                    end else begin
+                        for (integer k = 0; k < SECTOR_SIZE; k = k + 1) begin
+                            memory[erase_addr + k] <= 8'hFF;
+                        end
+                        erase_state <= ERASE_IDLE;
+                        status_reg[BUSY_BIT] <= 1'b0;
+                        $display("%t W25Q32: SECTOR ERASE completed at 0x%06h", $time, erase_addr);
+                    end
+                end
+            endcase
+        end
+    end
+
+    // Write enable logic 
+    always @(posedge clk_i or negedge rst_n) begin
+        if (!rst_n) begin
+            write_enable <= 1'b0;
+        end else begin
+            if (command_reg == CMD_WRITE_ENABLE && cs_n && state == STATE_CMD) begin
+                write_enable <= 1'b1;
+                status_reg[WEL_BIT] <= 1'b1;
+            end else if (command_reg == CMD_WRITE_DISABLE && cs_n && state == STATE_CMD) begin
+                write_enable <= 1'b0;
+                status_reg[WEL_BIT] <= 1'b0;
+            end else if ((command_reg == CMD_PAGE_PROGRAM || 
+                         command_reg == CMD_SECTOR_ERASE || 
+                         command_reg == CMD_CHIP_ERASE || 
+                         command_reg == CMD_CHIP_ERASE2) && cs_n && state != STATE_IDLE) begin
+                write_enable <= 1'b0; // Auto-clear after write operations
+                status_reg[WEL_BIT] <= 1'b0;
+            end
+        end
+    end
+
 
 endmodule
