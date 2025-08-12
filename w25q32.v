@@ -9,12 +9,15 @@ module W25Q32 (
     input  wire        hold_n  
 );
 
+
     // W25Q32 Parameters
     localparam MEMORY_SIZE = 1*1024*1024;  // 1MB  
     localparam PAGE_SIZE   = 64;           // 64 bytes per page
     localparam SECTOR_SIZE = 1024;         // 1024 bytes per block
     localparam ADDR_WIDTH  = 24;           // 24-bit addressing
-    
+    localparam DEVICE_ID   = 8'h15;
+    localparam MANUFACTURER = 8'hEF;
+
     // Instruction Opcodes
     localparam CMD_WRITE_ENABLE  = 8'h06;  // Write Enable
     localparam CMD_PAGE_PROGRAM  = 8'h02;  // Page Program
@@ -24,11 +27,12 @@ module W25Q32 (
     localparam CMD_CHIP_ERASE    = 8'hC7;  // Chip Erase
     localparam CMD_CHIP_ERASE2   = 8'h60;  // Chip Erase (same as the above)
     localparam CMD_READ_STATUS   = 8'h05;  // Read Status Register
-    
+    localparam CMD_READ_MFG_ID   = 8'h90;  // Read Manufacturer/Device ID
+
     // Status Register Bits
     localparam BUSY_BIT = 0;  // S0
-    localparam WEL_BIT  = 0;  // S1
-    
+    localparam WEL_BIT  = 1;  // S1 (corrected from 0 to 1)
+
     // SPI Slave interface wires
     wire       spi_rx_dv;
     wire [7:0] spi_rx_byte;
@@ -36,12 +40,15 @@ module W25Q32 (
     reg  [7:0] spi_tx_byte;
     wire       spi_miso;
 
+
     // Additional internal signals
     reg        write_enable;      // Write enable flag
     reg        spi_clk_prev;      // Previous SPI clock state for edge detection
 
+
     // Tie physical wires
     assign miso = spi_miso;
+
 
     // Instantiate SPI_Slave
     SPI_Slave #(
@@ -59,33 +66,37 @@ module W25Q32 (
         .i_SPI_CS_n(cs_n)
     );
 
+
     // State Machine States
-    localparam STATE_IDLE         = 3'b000;
-    localparam STATE_CMD          = 3'b001;
-    localparam STATE_ADDR         = 3'b010;
-    localparam STATE_READ_DATA    = 3'b011;
-    localparam STATE_PAGE_PROGRAM = 3'b100;
-    localparam STATE_READ_STATUS  = 3'b101;
-    
+    localparam STATE_IDLE         = 4'b0000;
+    localparam STATE_CMD          = 4'b0001;
+    localparam STATE_ADDR         = 4'b0010;
+    localparam STATE_READ_DATA    = 4'b0011;
+    localparam STATE_PAGE_PROGRAM = 4'b0100;
+    localparam STATE_READ_STATUS  = 4'b0101;
+    localparam STATE_READ_MFG_ID  = 4'b0110;  // New state for manufacturer/device ID
+
     // Internal Registers
-    reg [2:0]  state, next_state;
+    reg [3:0]  state, next_state;  // Changed from 2:0 to 3:0 for new state
     reg [7:0]  status_reg;        
     reg [7:0]  command_reg;     
     reg [23:0] address_reg;     
     reg [7:0]  data_buffer;       
     reg [4:0]  bit_counter;      
     reg [4:0]  byte_counter;
+    reg [1:0]  mfg_id_counter;    // Counter for manufacturer/device ID output
+
 
     // Erase operation states
     localparam ERASE_IDLE    = 2'b00;
     localparam ERASE_CHIP    = 2'b01;
     localparam ERASE_SECTOR  = 2'b10;
-    
+
     // Erase operation registers 
     reg [1:0]  erase_state;
     reg [23:0] erase_addr;
     reg [15:0] erase_counter;    // Counter for erase timing
-       
+
     // Memory array 
     reg [7:0] memory [0:MEMORY_SIZE-1];
 
@@ -98,6 +109,7 @@ module W25Q32 (
         status_reg = 8'h00;
         write_enable = 1'b0;
         erase_state = ERASE_IDLE;
+        mfg_id_counter = 2'b00;
     end    
 
     always @(posedge clk_i or negedge rst_n) begin
@@ -109,15 +121,16 @@ module W25Q32 (
             byte_counter<= 5'h00;
             spi_tx_dv   <= 1'b0;
             spi_tx_byte <= 8'h00;
+            mfg_id_counter <= 2'b00;
         end else begin
             // Default: Don't transmit unless specifically set below
             spi_tx_dv   <= 1'b0;
-            
             case (state)
                 STATE_IDLE: begin
                     if (spi_rx_dv && !cs_n) begin
                         command_reg <= spi_rx_byte;
                         byte_counter<= 0;
+                        mfg_id_counter <= 2'b00;
                         state <= STATE_CMD;
                     end
                 end
@@ -128,7 +141,7 @@ module W25Q32 (
                     end else begin
                         // Handle commands that need address
                         if ((command_reg == CMD_READ_DATA || command_reg == CMD_PAGE_PROGRAM || 
-                             command_reg == CMD_SECTOR_ERASE) && spi_rx_dv) begin
+                             command_reg == CMD_SECTOR_ERASE || command_reg == CMD_READ_MFG_ID) && spi_rx_dv) begin
                             address_reg[23:16] <= spi_rx_byte;
                             byte_counter <= 1;
                             state <= STATE_ADDR;
@@ -157,6 +170,9 @@ module W25Q32 (
                                 state <= STATE_READ_DATA;
                             end else if (command_reg == CMD_PAGE_PROGRAM && write_enable) begin
                                 state <= STATE_PAGE_PROGRAM;
+                            end else if (command_reg == CMD_READ_MFG_ID) begin
+                                state <= STATE_READ_MFG_ID;
+                                mfg_id_counter <= 2'b00;  // Reset counter for ID output
                             end
                         end
                     end
@@ -173,7 +189,7 @@ module W25Q32 (
                             spi_tx_byte <= 8'hFF; // Out of bounds
                         end
                         spi_tx_dv <= 1'b1;
-                        
+
                         // Increment address for next byte when current byte is read
                         if (spi_rx_dv) begin
                             address_reg <= (address_reg + 1) % MEMORY_SIZE; // Wrap around
@@ -187,7 +203,7 @@ module W25Q32 (
                         status_reg[BUSY_BIT] <= 1'b0;
                     end else if (spi_rx_dv && write_enable && address_reg < MEMORY_SIZE) begin
                         memory[address_reg] <= spi_rx_byte;
-                        
+
                         if ((address_reg & (PAGE_SIZE-1)) == (PAGE_SIZE-1)) begin
                             address_reg <= address_reg & ~(PAGE_SIZE-1);
                         end else begin
@@ -205,10 +221,35 @@ module W25Q32 (
                     end
                 end
 
+                STATE_READ_MFG_ID: begin
+                    if (cs_n) begin
+                        state <= STATE_IDLE;
+                    end else begin
+                        // Output manufacturer ID first, then device ID, then repeat
+                        case (mfg_id_counter[0])
+                            1'b0: begin
+                                spi_tx_byte <= MANUFACTURER;  // EFh
+                                spi_tx_dv <= 1'b1;
+                            end
+                            1'b1: begin
+                                spi_tx_byte <= DEVICE_ID;     // 15h
+                                spi_tx_dv <= 1'b1;
+                            end
+                        endcase
+
+                        // Increment counter when data is clocked out
+                        if (spi_rx_dv) begin
+                            mfg_id_counter <= mfg_id_counter + 1;
+                        end
+                    end
+                end
+
+
                 default: state <= STATE_IDLE;
             endcase
         end
     end
+
 
     always @(posedge clk_i or negedge rst_n) begin
         if (!rst_n) begin
@@ -233,7 +274,7 @@ module W25Q32 (
                         $display("%t W25Q32: SECTOR ERASE started at 0x%06h", $time, (address_reg / SECTOR_SIZE) * SECTOR_SIZE);
                     end
                 end
-                
+
                 ERASE_CHIP: begin
                     if (erase_counter > 0) begin
                         erase_counter <= erase_counter - 1;
@@ -250,7 +291,7 @@ module W25Q32 (
                         $display("%t W25Q32: CHIP ERASE completed", $time);
                     end
                 end
-                
+
                 ERASE_SECTOR: begin
                     if (erase_counter > 0) begin
                         erase_counter <= erase_counter - 1;
@@ -266,6 +307,7 @@ module W25Q32 (
             endcase
         end
     end
+
 
     // Write enable logic 
     always @(posedge clk_i or negedge rst_n) begin
