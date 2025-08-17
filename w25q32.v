@@ -10,10 +10,10 @@ module W25Q32 (
 );
 
     // W25Q32 Parameters
-    localparam MEMORY_SIZE = 1*1024*1024;  // 1MB  
+    localparam MEMORY_SIZE = 4*1024;       // 4KB (changes due to large array size) 
     localparam PAGE_SIZE   = 64;           // 64 bytes per page
-    localparam SECTOR_SIZE = 1024;         // 1024 bytes per block
-    localparam ADDR_WIDTH  = 24;           // 24-bit addressing
+    localparam SECTOR_SIZE = 512;          // 512 bytes per block (was 1024)
+    localparam ADDR_WIDTH  = 24;           // Keep 24-bit addressing
     localparam DEVICE_ID   = 8'h15;        // Device ID for W25Q32
     localparam MANUFACTURER = 8'hEF;       // Manufacturer ID for Winbond
 
